@@ -62,6 +62,86 @@ enum SendPropType_t
 #define DT_MAX_STRING_BITS			9
 #define DT_MAX_STRING_BUFFERSIZE	(1<<DT_MAX_STRING_BITS)	// Maximum length of a string that can be sent.
 
-void DecodeProp( CBitRead &entityBitBuffer, FlattenedPropEntry *pFlattenedProp, uint32 uClass, int nFieldIndex );
+struct Prop_t
+{
+	Prop_t()
+	{
+	}
+
+	Prop_t( SendPropType_t type )
+		: m_type( type )
+		, m_nNumElements( 0 )
+	{
+		// this makes all possible types init to 0's
+		m_value.m_vector.Init();
+	}
+
+	void Print( int nMaxElements = 0 )
+	{
+		if ( m_nNumElements > 0 )
+		{
+			printf( " Element: %d  ", ( nMaxElements ? nMaxElements : m_nNumElements ) - m_nNumElements );
+		}
+
+		switch ( m_type )
+		{
+			case DPT_Int:
+				{
+					printf( "%d\n", m_value.m_int );
+				}
+				break;
+			case DPT_Float:
+				{
+					printf( "%f\n", m_value.m_float );
+				}
+				break;
+			case DPT_Vector:
+				{
+					printf( "%f, %f, %f\n", m_value.m_vector.x, m_value.m_vector.y, m_value.m_vector.z );
+				}
+				break;
+			case DPT_VectorXY:
+				{
+					printf( "%f, %f\n", m_value.m_vector.x, m_value.m_vector.y );
+				}
+				break;
+			case DPT_String:
+				{
+					printf( "%s\n", m_value.m_pString );
+				}
+				break;
+			case DPT_Array:
+				break;
+			case DPT_DataTable:
+				break;
+			case DPT_Int64:
+				{
+					printf( "%lld\n", m_value.m_int64 );
+				}
+				break;
+		}
+
+		if ( m_nNumElements > 1 )
+		{
+			Prop_t *pProp = this;
+			pProp[ 1 ].Print( nMaxElements ? nMaxElements : m_nNumElements );
+		}
+	}
+
+	SendPropType_t m_type;
+	union
+	{
+		int m_int;
+		float m_float;
+		const char *m_pString;
+		int64 m_int64;
+		Vector m_vector;
+	} m_value;
+	int m_nNumElements;
+};
+
+struct FlattenedPropEntry;
+
+Prop_t *DecodeProp( CBitRead &entityBitBuffer, FlattenedPropEntry *pFlattenedProp, uint32 uClass, int nFieldIndex, bool bQuiet );
 
 #endif

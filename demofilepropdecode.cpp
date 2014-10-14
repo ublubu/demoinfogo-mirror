@@ -237,7 +237,7 @@ int64 Int64_Decode( CBitRead &entityBitBuffer, const CSVCMsg_SendTable::sendprop
 	}
 }
 
-void Array_Decode( CBitRead &entityBitBuffer, FlattenedPropEntry *pFlattenedProp, int nNumElements, uint32 uClass, int nFieldIndex )
+Prop_t *Array_Decode( CBitRead &entityBitBuffer, FlattenedPropEntry *pFlattenedProp, int nNumElements, uint32 uClass, int nFieldIndex, bool bQuiet )
 {
 	int maxElements = nNumElements;
 	int numBits = 1;
@@ -248,68 +248,70 @@ void Array_Decode( CBitRead &entityBitBuffer, FlattenedPropEntry *pFlattenedProp
 
 	int nElements = entityBitBuffer.ReadUBitLong( numBits );
 
-	printf( "array with %d elements of %d max\n", nElements, nNumElements );
+	Prop_t *pResult = NULL;
+	pResult = new Prop_t[ nElements ];
+
+	if ( !bQuiet )
+	{
+		printf( "array with %d elements of %d max\n", nElements, nNumElements );
+	}
 
 	for ( int i = 0; i < nElements; i++ )
 	{
 		FlattenedPropEntry temp( pFlattenedProp->m_arrayElementProp, NULL );
-		printf( " Element: %d  ", i );
-		DecodeProp( entityBitBuffer, &temp, uClass, nFieldIndex );
+		Prop_t *pElementResult = DecodeProp( entityBitBuffer, &temp, uClass, nFieldIndex, bQuiet );
+		pResult[ i ] = *pElementResult;
+		delete pElementResult;
+		pResult[ i ].m_nNumElements = nElements - i;
 	}
+
+	return pResult;
 }
 
-void DecodeProp( CBitRead &entityBitBuffer, FlattenedPropEntry *pFlattenedProp, uint32 uClass, int nFieldIndex )
+Prop_t *DecodeProp( CBitRead &entityBitBuffer, FlattenedPropEntry *pFlattenedProp, uint32 uClass, int nFieldIndex, bool bQuiet )
 {
 	const CSVCMsg_SendTable::sendprop_t *pSendProp = pFlattenedProp->m_prop;
 
-	printf( "Field: %d, %s = ", nFieldIndex, pSendProp->var_name().c_str() );
+	Prop_t *pResult = NULL;
+	if ( pSendProp->type() != DPT_Array && pSendProp->type() != DPT_DataTable )
+	{
+		pResult = new Prop_t( ( SendPropType_t )( pSendProp->type() ) );
+	}
+
+	if ( !bQuiet )
+	{
+		printf( "Field: %d, %s = ", nFieldIndex, pSendProp->var_name().c_str() );
+	}
 	switch ( pSendProp->type() )
 	{
 		case DPT_Int:
-			{
-				int nValue = Int_Decode( entityBitBuffer, pSendProp );
-				printf( "%d\n", nValue );
-			}
+			pResult->m_value.m_int = Int_Decode( entityBitBuffer, pSendProp );
 			break;
 		case DPT_Float:
-			{
-				float fValue = Float_Decode( entityBitBuffer, pSendProp );
-				printf( "%f\n", fValue );
-			}
+			pResult->m_value.m_float = Float_Decode( entityBitBuffer, pSendProp );
 			break;
 		case DPT_Vector:
-			{
-				Vector value;
-				Vector_Decode( entityBitBuffer, pSendProp, value );
-				printf( "%f, %f, %f\n", value.x, value.y, value.z );
-			}
+			Vector_Decode( entityBitBuffer, pSendProp, pResult->m_value.m_vector );
 			break;
 		case DPT_VectorXY:
-			{
-				Vector value;
-				VectorXY_Decode( entityBitBuffer, pSendProp, value );
-				printf( "%f, %f\n", value.x, value.y );
-			}
+			VectorXY_Decode( entityBitBuffer, pSendProp, pResult->m_value.m_vector );
 			break;
 		case DPT_String:
-			{
-				const char *pString = String_Decode( entityBitBuffer, pSendProp );
-				printf( "%s\n", pString );
-				delete pString;
-			}
+			pResult->m_value.m_pString = String_Decode( entityBitBuffer, pSendProp );
 			break;
 		case DPT_Array:
-			{
-				Array_Decode( entityBitBuffer, pFlattenedProp, pSendProp->num_elements(), uClass, nFieldIndex );
-			}
+			pResult = Array_Decode( entityBitBuffer, pFlattenedProp, pSendProp->num_elements(), uClass, nFieldIndex, bQuiet );
 			break;
 		case DPT_DataTable:
 			break;
 		case DPT_Int64:
-			{
-				int64 nValue = Int64_Decode( entityBitBuffer, pSendProp );
-				printf( "%lld\n", nValue );
-			}
+			pResult->m_value.m_int64 = Int64_Decode( entityBitBuffer, pSendProp );
 			break;
 	}
+	if ( !bQuiet )
+	{
+		pResult->Print();
+	}
+
+	return pResult;
 }

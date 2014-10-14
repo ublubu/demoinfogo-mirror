@@ -43,8 +43,23 @@ static int s_nServerClassBits = 0;
 static std::vector< ServerClass_t > s_ServerClasses;
 static std::vector< CSVCMsg_SendTable > s_DataTables;
 static std::vector< ExcludeEntry > s_currentExcludes;
+static std::vector< EntityEntry * > s_Entities;
+static std::vector< player_info_t > s_PlayerInfos;
 
-static std::vector< EntityEntry > s_Entities;
+extern bool g_bDumpGameEvents;
+extern bool g_bSupressFootstepEvents;
+extern bool g_bShowExtraPlayerInfoInGameEvents;
+extern bool g_bDumpDeaths;
+extern bool g_bSupressWarmupDeaths;
+extern bool g_bDumpStringTables;
+extern bool g_bDumpDataTables;
+extern bool g_bDumpPacketEntities;
+extern bool g_bDumpNetMessages;
+
+static bool s_bMatchStartOccured = false;
+static int s_nCurrentTick;
+
+EntityEntry *FindEntity( int nEntity );
 
 __declspec( noreturn ) void fatal_errorf( const char* fmt, ... )
 {
@@ -73,15 +88,18 @@ bool CDemoFileDump::Open( const char *filename )
 
 void CDemoFileDump::MsgPrintf( const ::google::protobuf::Message& msg, int size, const char *fmt, ... )
 {
-	va_list vlist;
-	const std::string& TypeName = msg.GetTypeName();
+	if ( g_bDumpNetMessages )
+	{
+		va_list vlist;
+		const std::string& TypeName = msg.GetTypeName();
 
-	// Print the message type and size
-	printf( "---- %s (%d bytes) -----------------\n", TypeName.c_str(), size );
+		// Print the message type and size
+		printf( "---- %s (%d bytes) -----------------\n", TypeName.c_str(), size );
 
-	va_start( vlist, fmt);
-	vprintf( fmt, vlist );
-	va_end( vlist );
+		va_start( vlist, fmt);
+		vprintf( fmt, vlist );
+		va_end( vlist );
+	}
 }
 
 template < class T, int msgType >
@@ -189,6 +207,342 @@ void PrintNetMessage< CSVCMsg_UserMessage, svc_UserMessage >( CDemoFileDump& Dem
 	Demo.DumpUserMessage( parseBuffer, BufferSize );
 }
 
+player_info_t *FindPlayerInfo( int userId )
+{
+	for ( std::vector< player_info_t >::iterator i = s_PlayerInfos.begin(); i != s_PlayerInfos.end(); i++ )
+	{
+		if (  i->userID == userId )
+		{
+			return &(*i);
+		}
+	}
+
+	return NULL;
+}
+
+int FindPlayerEntityIndex( int userId )
+{
+	int nIndex = 0;
+	for ( std::vector< player_info_t >::iterator i = s_PlayerInfos.begin(); i != s_PlayerInfos.end(); i++ )
+	{
+		if (  i->userID == userId )
+		{
+			return nIndex;
+		}
+		nIndex++;
+	}
+
+	return -1;
+}
+
+const CSVCMsg_GameEventList::descriptor_t *GetGameEventDescriptor( const CSVCMsg_GameEvent &msg, CDemoFileDump& Demo )
+{
+	int iDescriptor;
+
+	for ( iDescriptor = 0; iDescriptor < Demo.m_GameEventList.descriptors().size(); iDescriptor++ )
+	{
+		const CSVCMsg_GameEventList::descriptor_t& Descriptor = Demo.m_GameEventList.descriptors( iDescriptor );
+
+		if ( Descriptor.eventid() == msg.eventid() )
+			break;
+	}
+
+	if ( iDescriptor == Demo.m_GameEventList.descriptors().size() )
+	{
+		if ( g_bDumpGameEvents )
+		{
+			printf( "%s", msg.DebugString() );
+		}
+		return NULL;
+	}
+
+	return &Demo.m_GameEventList.descriptors( iDescriptor );
+}
+
+bool HandlePlayerConnectDisconnectEvents( const CSVCMsg_GameEvent &msg, const CSVCMsg_GameEventList::descriptor_t *pDescriptor )
+{
+	// need to handle player_connect and player_disconnect because this is the only place bots get added to our player info array
+	// actual players come in via string tables
+	bool bPlayerDisconnect = ( pDescriptor->name().compare( "player_disconnect" ) == 0 );
+	if ( pDescriptor->name().compare( "player_connect" ) == 0 || bPlayerDisconnect )
+	{
+		int numKeys = msg.keys().size();
+		int userid = -1;
+		unsigned int index = -1;
+		const char *name = NULL;
+		bool bBot = false;
+		const char *reason = NULL;
+		for ( int i = 0; i < numKeys; i++ )
+		{
+			const CSVCMsg_GameEventList::key_t& Key = pDescriptor->keys( i );
+			const CSVCMsg_GameEvent::key_t& KeyValue = msg.keys( i );
+
+			if ( Key.name().compare( "userid" ) == 0 )
+			{
+				userid = KeyValue.val_short();
+			}
+			else if ( Key.name().compare( "index" ) == 0 )
+			{
+				index = KeyValue.val_byte();
+			}
+			else if ( Key.name().compare( "name" ) == 0 )
+			{
+				name = KeyValue.val_string().c_str();
+			}
+			else if ( Key.name().compare( "networkid" ) == 0 )
+			{
+				bBot = ( KeyValue.val_string().compare( "BOT" ) == 0 );
+			}
+			else if ( Key.name().compare( "bot" ) == 0 )
+			{
+				bBot = KeyValue.val_bool();
+			}
+			else if ( Key.name().compare( "reason" ) == 0 )
+			{
+				reason = KeyValue.val_string().c_str();
+			}
+		}
+
+		if ( bPlayerDisconnect )
+		{
+			if ( g_bDumpGameEvents )
+			{
+				printf( "Player %s (id:%d) disconnected. reason:%s\n", name, userid, reason );
+			}
+			// mark the player info slot as disconnected
+			player_info_t *pPlayerInfo = FindPlayerInfo( userid );
+			strcpy_s( pPlayerInfo->name, "disconnected" );
+			pPlayerInfo->userID = -1;
+			pPlayerInfo->guid[ 0 ] = 0;
+		}
+		else
+		{
+			player_info_t newPlayer;
+			memset( &newPlayer, 0, sizeof(newPlayer) );
+			newPlayer.userID = userid;
+			strcpy_s( newPlayer.name, name );
+			newPlayer.fakeplayer = bBot;
+			if ( bBot )
+			{
+				strcpy_s( newPlayer.guid, "BOT" );
+			}
+				
+			if ( index < s_PlayerInfos.size() )
+			{
+				// only replace existing player slot if the userID is different (very unlikely)
+				if ( s_PlayerInfos[ index ].userID != userid )
+				{
+					s_PlayerInfos[ index ] = newPlayer;
+				}
+			}
+			else
+			{
+				if ( g_bDumpGameEvents )
+				{
+					printf( "Player %s %s (id:%d) connected.\n", newPlayer.guid, name, userid );
+				}
+				s_PlayerInfos.push_back( newPlayer );
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
+bool ShowPlayerInfo( const char *pField, int nIndex, bool bShowDetails = true, bool bCSV = false )
+{
+	player_info_t *pPlayerInfo = FindPlayerInfo( nIndex );
+	if ( pPlayerInfo )
+	{
+		if ( bCSV )
+		{
+			printf( "%s, %s, %d", pField, pPlayerInfo->name, nIndex );
+		}
+		else
+		{
+			printf( " %s: %s (id:%d)\n", pField, pPlayerInfo->name, nIndex );
+		}
+
+		if ( bShowDetails )
+		{
+			EntityEntry *pEntity = FindEntity( nIndex - 1 );
+			if ( pEntity )
+			{
+				PropEntry *pXYProp = pEntity->FindProp( "m_vecOrigin" );
+				PropEntry *pZProp = pEntity->FindProp( "m_vecOrigin[2]" );
+				if ( pXYProp && pZProp )
+				{
+					if ( bCSV )
+					{
+						printf( ", %f, %f, %f", pXYProp->m_pPropValue->m_value.m_vector.x, pXYProp->m_pPropValue->m_value.m_vector.y, pZProp->m_pPropValue->m_value.m_float );
+					}
+					else
+					{
+						printf( "  position: %f, %f, %f\n", pXYProp->m_pPropValue->m_value.m_vector.x, pXYProp->m_pPropValue->m_value.m_vector.y, pZProp->m_pPropValue->m_value.m_float );
+					}
+				}
+				PropEntry *pAngle0Prop = pEntity->FindProp( "m_angEyeAngles[0]" );
+				PropEntry *pAngle1Prop = pEntity->FindProp( "m_angEyeAngles[1]" );
+				if ( pAngle0Prop && pAngle1Prop )
+				{
+					if ( bCSV )
+					{
+						printf( ", %f, %f", pAngle0Prop->m_pPropValue->m_value.m_float, pAngle1Prop->m_pPropValue->m_value.m_float );
+					}
+					else
+					{
+						printf( "  facing: pitch:%f, yaw:%f\n", pAngle0Prop->m_pPropValue->m_value.m_float, pAngle1Prop->m_pPropValue->m_value.m_float );
+					}
+				}
+				PropEntry *pTeamProp = pEntity->FindProp( "m_iTeamNum" );
+				if ( pTeamProp )
+				{
+					if ( bCSV )
+					{
+						printf( ", %s", ( pTeamProp->m_pPropValue->m_value.m_int == 2 ) ? "T" : "CT" );
+					}
+					else
+					{
+						printf( "  team: %s\n", ( pTeamProp->m_pPropValue->m_value.m_int == 2 ) ? "T" : "CT" );
+					}
+				}
+			}
+		}
+		return true;
+	}
+	return false;
+}
+
+void HandlePlayerDeath( const CSVCMsg_GameEvent &msg, const CSVCMsg_GameEventList::descriptor_t *pDescriptor )
+{
+	int numKeys = msg.keys().size();
+
+	int userid = -1;
+	int attackerid = -1;
+	int assisterid = 0;
+	const char *pWeaponName = NULL;
+	bool bHeadshot = false;
+	for ( int i = 0; i < numKeys; i++ )
+	{
+		const CSVCMsg_GameEventList::key_t& Key = pDescriptor->keys( i );
+		const CSVCMsg_GameEvent::key_t& KeyValue = msg.keys( i );
+
+		if ( Key.name().compare( "userid" ) == 0 )
+		{
+			userid = KeyValue.val_short();
+		}
+		else if ( Key.name().compare( "attacker" ) == 0 )
+		{
+			attackerid = KeyValue.val_short();
+		}
+		else if ( Key.name().compare( "assister" ) == 0 )
+		{
+			assisterid = KeyValue.val_short();
+		}
+		else if ( Key.name().compare( "weapon" ) == 0 )
+		{
+			pWeaponName = KeyValue.val_string().c_str();
+		}
+		else if ( Key.name().compare( "headshot" ) == 0 )
+		{
+			bHeadshot = KeyValue.val_bool();
+		}
+	}
+	
+	ShowPlayerInfo( "victim", userid, true, true );
+	printf ( ", " );
+	ShowPlayerInfo( "attacker", attackerid, true, true );
+	printf( ", %s, %s", pWeaponName, bHeadshot ? "true" : "false" );
+	if ( assisterid != 0 )
+	{
+		printf ( ", " );
+		ShowPlayerInfo( "assister", assisterid, true, true );
+	}
+	printf( "\n" );
+}
+
+void ParseGameEvent( const CSVCMsg_GameEvent &msg, const CSVCMsg_GameEventList::descriptor_t *pDescriptor )
+{
+
+	if ( pDescriptor )
+	{
+		if ( !( pDescriptor->name().compare( "player_footstep" ) == 0 && g_bSupressFootstepEvents ) )
+		{
+			if ( !HandlePlayerConnectDisconnectEvents( msg, pDescriptor ) )
+			{
+				if ( pDescriptor->name().compare( "round_announce_match_start" ) == 0 )
+				{
+					s_bMatchStartOccured = true;
+				}
+
+				bool bAllowDeathReport = !g_bSupressWarmupDeaths || s_bMatchStartOccured;
+				if ( pDescriptor->name().compare( "player_death" ) == 0 && g_bDumpDeaths && bAllowDeathReport )
+				{
+					HandlePlayerDeath( msg, pDescriptor );
+				}
+
+				if ( g_bDumpGameEvents )
+				{
+					printf( "%s\n{\n", pDescriptor->name().c_str() );
+				}
+				int numKeys = msg.keys().size();
+				for ( int i = 0; i < numKeys; i++ )
+				{
+					const CSVCMsg_GameEventList::key_t& Key = pDescriptor->keys( i );
+					const CSVCMsg_GameEvent::key_t& KeyValue = msg.keys( i );
+
+					if ( g_bDumpGameEvents )
+					{
+						bool bHandled = false;
+						if ( Key.name().compare( "userid" ) == 0 || Key.name().compare( "attacker" ) == 0 || Key.name().compare( "assister" ) == 0 )
+						{
+							bHandled = ShowPlayerInfo( Key.name().c_str(), KeyValue.val_short(), g_bShowExtraPlayerInfoInGameEvents );
+						}
+						if ( !bHandled )
+						{
+							printf(" %s: ", Key.name().c_str() );
+
+							if ( KeyValue.has_val_string() )
+							{
+								printf( "%s ", KeyValue.val_string().c_str() );
+							}
+							if ( KeyValue.has_val_float() )
+							{
+								printf( "%f ", KeyValue.val_float() );
+							}
+							if ( KeyValue.has_val_long() )
+							{
+								printf( "%d ", KeyValue.val_long() );
+							}
+							if ( KeyValue.has_val_short() )
+							{
+								printf( "%d ", KeyValue.val_short() );
+							}
+							if ( KeyValue.has_val_byte() )
+							{
+								printf( "%d ", KeyValue.val_byte() );
+							}
+							if ( KeyValue.has_val_bool() )
+							{
+								printf( "%d ", KeyValue.val_bool() );
+							}
+							if ( KeyValue.has_val_uint64() )
+							{
+								printf( "%lld ", KeyValue.val_uint64() );
+							}
+							printf( "\n" );
+						}
+					}
+				}
+				if ( g_bDumpGameEvents )
+				{
+					printf( "}\n" );
+				}
+			}
+		}
+	}
+}
+
 template <>
 void PrintNetMessage< CSVCMsg_GameEvent, svc_GameEvent >( CDemoFileDump& Demo, const void *parseBuffer, int BufferSize )
 {
@@ -196,66 +550,10 @@ void PrintNetMessage< CSVCMsg_GameEvent, svc_GameEvent >( CDemoFileDump& Demo, c
 
 	if ( msg.ParseFromArray( parseBuffer, BufferSize ) )
 	{
-		int iDescriptor;
-
-		for ( iDescriptor = 0; iDescriptor < Demo.m_GameEventList.descriptors().size(); iDescriptor++ )
+		const CSVCMsg_GameEventList::descriptor_t *pDescriptor = GetGameEventDescriptor( msg, Demo );
+		if ( pDescriptor )
 		{
-			const CSVCMsg_GameEventList::descriptor_t& Descriptor = Demo.m_GameEventList.descriptors( iDescriptor );
-
-			if ( Descriptor.eventid() == msg.eventid() )
-				break;
-		}
-
-		if ( iDescriptor == Demo.m_GameEventList.descriptors().size() )
-		{
-			printf( "%s", msg.DebugString() );
-		}
-		else
-		{
-			int numKeys = msg.keys().size();
-			const CSVCMsg_GameEventList::descriptor_t& Descriptor = Demo.m_GameEventList.descriptors( iDescriptor );
-
-			printf( "%s eventid:%d %s\n", Descriptor.name().c_str(), msg.eventid(),
-				msg.has_event_name() ? msg.event_name().c_str() : "" );
-
-			for ( int i = 0; i < numKeys; i++ )
-			{
-				const CSVCMsg_GameEventList::key_t& Key = Descriptor.keys( i );
-				const CSVCMsg_GameEvent::key_t& KeyValue = msg.keys( i );
-
-				printf(" %s: ", Key.name().c_str() );
-
-				if ( KeyValue.has_val_string() )
-				{
-					printf( "%s ", KeyValue.val_string().c_str() );
-				}
-				if ( KeyValue.has_val_float() )
-				{
-					printf( "%f ", KeyValue.val_float() );
-				}
-				if ( KeyValue.has_val_long() )
-				{
-					printf( "%d ", KeyValue.val_long() );
-				}
-				if ( KeyValue.has_val_short() )
-				{
-					printf( "%d ", KeyValue.val_short() );
-				}
-				if ( KeyValue.has_val_byte() )
-				{
-					printf( "%d ", KeyValue.val_byte() );
-				}
-				if ( KeyValue.has_val_bool() )
-				{
-					printf( "%d ", KeyValue.val_bool() );
-				}
-				if ( KeyValue.has_val_uint64() )
-				{
-					printf( "%lld ", KeyValue.val_uint64() );
-				}
-
-				printf( "\n" );
-			}
+			ParseGameEvent( msg, pDescriptor );
 		}
 	}
 }
@@ -374,7 +672,7 @@ void ParseStringTableUpdate( CBitRead &buf, int entries, int nMaxEntries, int us
 			pEntry = "";// avoid crash because of NULL strings
 		}
 
-		if ( bIsUserInfo && nBytes == sizeof( player_info_t ) )
+		if ( bIsUserInfo && pUserData != NULL )
 		{
 			const player_info_t *pUnswappedPlayerInfo = ( const player_info_t * )pUserData;
 			player_info_t playerInfo = *pUnswappedPlayerInfo;
@@ -383,13 +681,30 @@ void ParseStringTableUpdate( CBitRead &buf, int entries, int nMaxEntries, int us
 			LowLevelByteSwap( &playerInfo.userID, &pUnswappedPlayerInfo->userID );
 			LowLevelByteSwap( &playerInfo.friendsID, &pUnswappedPlayerInfo->friendsID );
 
-			printf( "    xuid:%lld name:%s userID:%d guid:%s friendsID:%d friendsName:%s fakeplayer:%d ishltv:%d filesDownloaded:%d\n",
-				playerInfo.xuid, playerInfo.name, playerInfo.userID, playerInfo.guid, playerInfo.friendsID,
-				playerInfo.friendsName, playerInfo.fakeplayer, playerInfo.ishltv, playerInfo.filesDownloaded );
+			bool bAdded = false;
+			if ( (unsigned int)entryIndex < s_PlayerInfos.size() )
+			{
+				s_PlayerInfos[ entryIndex ] = playerInfo;
+			}
+			else
+			{
+				bAdded = true;
+				s_PlayerInfos.push_back( playerInfo );
+			}
+
+			if ( g_bDumpStringTables )
+			{
+				printf( "player info\n{\n %s:true\n xuid:%lld\n name:%s\n userID:%d\n guid:%s\n friendsID:%d\n friendsName:%s\n fakeplayer:%d\n ishltv:%d\n filesDownloaded:%d\n}\n",
+					bAdded ? "adding" : "updating", playerInfo.xuid, playerInfo.name, playerInfo.userID, playerInfo.guid, playerInfo.friendsID,
+					playerInfo.friendsName, playerInfo.fakeplayer, playerInfo.ishltv, playerInfo.filesDownloaded );
+			}
 		}
 		else
 		{
-			printf( " %d, %s, %d, %s \n", entryIndex, pEntry, nBytes, pUserData );
+			if ( g_bDumpStringTables )
+			{
+				printf( " %d, %s, %d, %s \n", entryIndex, pEntry, nBytes, pUserData );
+			}
 		}
 
 
@@ -412,7 +727,10 @@ void PrintNetMessage< CSVCMsg_CreateStringTable, svc_CreateStringTable >( CDemoF
 	if ( msg.ParseFromArray( parseBuffer, BufferSize ) )
 	{
 		bool bIsUserInfo = !strcmp( msg.name().c_str(), "userinfo" );
-		printf( "CreateStringTable:%s:%d:%d:%d:%d:\n", msg.name().c_str(), msg.max_entries(), msg.num_entries(), msg.user_data_size(), msg.user_data_size_bits() );
+		if ( g_bDumpStringTables )
+		{
+			printf( "CreateStringTable:%s:%d:%d:%d:%d:\n", msg.name().c_str(), msg.max_entries(), msg.num_entries(), msg.user_data_size(), msg.user_data_size_bits() );
+		}
 		CBitRead data( &msg.string_data()[ 0 ], msg.string_data().size() );
 		ParseStringTableUpdate( data,  msg.num_entries(), msg.max_entries(), msg.user_data_size(), msg.user_data_size_bits(), msg.user_data_fixed_size(), bIsUserInfo ); 
 
@@ -434,7 +752,10 @@ void PrintNetMessage< CSVCMsg_UpdateStringTable, svc_UpdateStringTable >( CDemoF
 		if ( msg.table_id() < s_nNumStringTables && s_StringTables[ msg.table_id() ].nMaxEntries > msg.num_changed_entries() )
 		{
 			bool bIsUserInfo = !strcmp( s_StringTables[ msg.table_id() ].szName, "userinfo" );
-			printf( "UpdateStringTable:%d(%s):%d:\n", msg.table_id(), s_StringTables[ msg.table_id() ].szName, msg.num_changed_entries() );
+			if ( g_bDumpStringTables )
+			{
+				printf( "UpdateStringTable:%d(%s):%d:\n", msg.table_id(), s_StringTables[ msg.table_id() ].szName, msg.num_changed_entries() );
+			}
 			ParseStringTableUpdate( data, msg.num_changed_entries(), s_StringTables[ msg.table_id() ].nMaxEntries, 0, 0, 0, bIsUserInfo ); 
 		}
 		else
@@ -446,23 +767,26 @@ void PrintNetMessage< CSVCMsg_UpdateStringTable, svc_UpdateStringTable >( CDemoF
 
 void RecvTable_ReadInfos( const CSVCMsg_SendTable& msg )
 {
-	printf( "%s:%d\n", msg.net_table_name().c_str(), msg.props_size() ); 
-
-	for ( int iProp=0; iProp < msg.props_size(); iProp++ )
+	if ( g_bDumpDataTables )
 	{
-		const CSVCMsg_SendTable::sendprop_t& sendProp = msg.props( iProp );
+		printf( "%s:%d\n", msg.net_table_name().c_str(), msg.props_size() ); 
+	
+		for ( int iProp=0; iProp < msg.props_size(); iProp++ )
+		{
+			const CSVCMsg_SendTable::sendprop_t& sendProp = msg.props( iProp );
 
-		if ( ( sendProp.type() == DPT_DataTable ) || ( sendProp.flags() & SPROP_EXCLUDE ) )
-		{
-			printf( "%d:%06X:%s:%s%s\n", sendProp.type(), sendProp.flags(), sendProp.var_name().c_str(), sendProp.dt_name().c_str(), ( sendProp.flags() & SPROP_EXCLUDE ) ? " exclude" : "" );
-		}
-		else if ( sendProp.type() == DPT_Array )
-		{
-			printf( "%d:%06X:%s[%d]\n", sendProp.type(), sendProp.flags(), sendProp.var_name().c_str(), sendProp.num_elements() );
-		}
-		else
-		{
-			printf( "%d:%06X:%s:%f,%f,%08X%s\n", sendProp.type(), sendProp.flags(), sendProp.var_name().c_str(), sendProp.low_value(), sendProp.high_value(), sendProp.num_bits(), ( sendProp.flags() & SPROP_INSIDEARRAY ) ? " inside array" : "" );
+			if ( ( sendProp.type() == DPT_DataTable ) || ( sendProp.flags() & SPROP_EXCLUDE ) )
+			{
+				printf( "%d:%06X:%s:%s%s\n", sendProp.type(), sendProp.flags(), sendProp.var_name().c_str(), sendProp.dt_name().c_str(), ( sendProp.flags() & SPROP_EXCLUDE ) ? " exclude" : "" );
+			}
+			else if ( sendProp.type() == DPT_Array )
+			{
+				printf( "%d:%06X:%s[%d]\n", sendProp.type(), sendProp.flags(), sendProp.var_name().c_str(), sendProp.num_elements() );
+			}
+			else
+			{
+				printf( "%d:%06X:%s:%f,%f,%08X%s\n", sendProp.type(), sendProp.flags(), sendProp.var_name().c_str(), sendProp.low_value(), sendProp.high_value(), sendProp.num_bits(), ( sendProp.flags() & SPROP_INSIDEARRAY ) ? " inside array" : "" );
+			}
 		}
 	}
 }
@@ -713,7 +1037,7 @@ int ReadFieldIndex( CBitRead &entityBitBuffer, int lastIndex, bool bNewWay )
 	return lastIndex + 1 + ret;
 }
 
-bool ReadNewEntity( CBitRead &entityBitBuffer, int nNewEntity, uint32 uClass, uint32 uSerialNum )
+bool ReadNewEntity( CBitRead &entityBitBuffer, EntityEntry *pEntity )
 {
 	bool bNewWay = ( entityBitBuffer.ReadOneBit() == 1 );  // 0 = old way, 1 = new way
 
@@ -729,14 +1053,18 @@ bool ReadNewEntity( CBitRead &entityBitBuffer, int nNewEntity, uint32 uClass, ui
 		}
 	} while (index != -1);
 
-	CSVCMsg_SendTable *pTable = GetTableByClassID( uClass );
-	printf( "Table: %s\n", pTable->net_table_name().c_str() );
+	CSVCMsg_SendTable *pTable = GetTableByClassID( pEntity->m_uClass );
+	if ( g_bDumpPacketEntities )
+	{
+		printf( "Table: %s\n", pTable->net_table_name().c_str() );
+	}
 	for ( unsigned int i = 0; i < fieldIndices.size(); i++ )
 	{
-		FlattenedPropEntry *pSendProp = GetSendPropByIndex( uClass, fieldIndices[ i ] );
+		FlattenedPropEntry *pSendProp = GetSendPropByIndex( pEntity->m_uClass, fieldIndices[ i ] );
 		if ( pSendProp )
 		{
-			DecodeProp( entityBitBuffer, pSendProp, uClass, fieldIndices[ i ] );
+			Prop_t *pProp = DecodeProp( entityBitBuffer, pSendProp, pEntity->m_uClass, fieldIndices[ i ], !g_bDumpPacketEntities );
+			pEntity->AddOrUpdateProp( pSendProp, pProp );
 		}
 		else
 		{
@@ -749,18 +1077,18 @@ bool ReadNewEntity( CBitRead &entityBitBuffer, int nNewEntity, uint32 uClass, ui
 
 EntityEntry *FindEntity( int nEntity )
 {
-	for ( std::vector< EntityEntry >::iterator i = s_Entities.begin(); i != s_Entities.end(); i++ )
+	for ( std::vector< EntityEntry * >::iterator i = s_Entities.begin(); i != s_Entities.end(); i++ )
 	{
-		if (  i->m_nEntity == nEntity )
+		if (  (*i)->m_nEntity == nEntity )
 		{
-			return &(*i);
+			return *i;
 		}
 	}
 
 	return NULL;
 }
 
-void AddEntity( int nEntity, uint32 uClass, uint32 uSerialNum )
+EntityEntry *AddEntity( int nEntity, uint32 uClass, uint32 uSerialNum )
 {
 	// if entity already exists, then replace it, else add it
 	EntityEntry *pEntity = FindEntity( nEntity );
@@ -771,17 +1099,22 @@ void AddEntity( int nEntity, uint32 uClass, uint32 uSerialNum )
 	}
 	else
 	{
-		s_Entities.push_back( EntityEntry( nEntity, uClass, uSerialNum ) );
+		pEntity = new EntityEntry( nEntity, uClass, uSerialNum );
+		s_Entities.push_back( pEntity );
 	}
+
+	return pEntity;
 }
 
 void RemoveEntity( int nEntity )
 {
-	for ( std::vector< EntityEntry >::iterator i = s_Entities.begin(); i != s_Entities.end(); i++ )
+	for ( std::vector< EntityEntry * >::iterator i = s_Entities.begin(); i != s_Entities.end(); i++ )
 	{
-		if (  i->m_nEntity == nEntity )
+		EntityEntry *pEntity = *i;
+		if (  pEntity->m_nEntity == nEntity )
 		{
 			s_Entities.erase( i );
+			delete pEntity;
 			break;
 		}
 	}
@@ -868,13 +1201,16 @@ void PrintNetMessage< CSVCMsg_PacketEntities, svc_PacketEntities >( CDemoFileDum
 						{
 							uint32 uClass = entityBitBuffer.ReadUBitLong( s_nServerClassBits );
 							uint32 uSerialNum = entityBitBuffer.ReadUBitLong( NUM_NETWORKED_EHANDLE_SERIAL_NUMBER_BITS );
-							printf( "Entity Enters PVS: id:%d, class:%d, serial:%d\n", nNewEntity, uClass, uSerialNum );
-							if ( !ReadNewEntity( entityBitBuffer, nNewEntity, uClass, uSerialNum ) )
+							if ( g_bDumpPacketEntities )
+							{
+								printf( "Entity Enters PVS: id:%d, class:%d, serial:%d\n", nNewEntity, uClass, uSerialNum );
+							}
+							EntityEntry *pEntity = AddEntity( nNewEntity, uClass, uSerialNum );
+							if ( !ReadNewEntity( entityBitBuffer, pEntity ) )
 							{
 								printf( "*****Error reading entity! Bailing on this PacketEntities!\n" );
 								return;
 							}
-							AddEntity( nNewEntity, uClass, uSerialNum );
 						}
 						break;
 
@@ -888,13 +1224,16 @@ void PrintNetMessage< CSVCMsg_PacketEntities, svc_PacketEntities >( CDemoFileDum
 							}
 							else
 							{
-								if ( UpdateFlags & FHDR_DELETE )
+								if ( g_bDumpPacketEntities )
 								{
-									printf( "Entity leaves PVS and is deleted: id:%d\n", nNewEntity );
-								}
-								else
-								{
-									printf( "Entity leaves PVS: id:%d\n", nNewEntity );
+									if ( UpdateFlags & FHDR_DELETE )
+									{
+										printf( "Entity leaves PVS and is deleted: id:%d\n", nNewEntity );
+									}
+									else
+									{
+										printf( "Entity leaves PVS: id:%d\n", nNewEntity );
+									}
 								}
 								RemoveEntity( nNewEntity );
 							}
@@ -906,8 +1245,11 @@ void PrintNetMessage< CSVCMsg_PacketEntities, svc_PacketEntities >( CDemoFileDum
 							EntityEntry *pEntity = FindEntity( nNewEntity );
 							if ( pEntity )
 							{
-								printf( "Entity Delta update: id:%d, class:%d, serial:%d\n", pEntity->m_nEntity, pEntity->m_uClass, pEntity->m_uSerialNum );
-								if ( !ReadNewEntity( entityBitBuffer, pEntity->m_nEntity, pEntity->m_uClass, pEntity->m_uSerialNum ) )
+								if ( g_bDumpPacketEntities )
+								{
+									printf( "Entity Delta update: id:%d, class:%d, serial:%d\n", pEntity->m_nEntity, pEntity->m_uClass, pEntity->m_uSerialNum );
+								}
+								if ( !ReadNewEntity( entityBitBuffer, pEntity ) )
 								{
 									printf( "*****Error reading entity! Bailing on this PacketEntities!\n" );
 									return;
@@ -937,7 +1279,10 @@ void PrintNetMessage< CSVCMsg_PacketEntities, svc_PacketEntities >( CDemoFileDum
 								}
 								else
 								{
-									printf( "PreserveEnt: id:%d\n", nNewEntity );
+									if ( g_bDumpPacketEntities )
+									{
+										printf( "PreserveEnt: id:%d\n", nNewEntity );
+									}
 								}
 							}
 						}
@@ -1126,17 +1471,26 @@ bool ParseDataTable( CBitRead &buf )
 			}
 		}
 
-		printf( "class:%d:%s:%s(%d)\n", entry.nClassID, entry.strName, entry.strDTName, entry.nDataTable );
+		if ( g_bDumpDataTables )
+		{
+			printf( "class:%d:%s:%s(%d)\n", entry.nClassID, entry.strName, entry.strDTName, entry.nDataTable );
+		}
 		s_ServerClasses.push_back( entry );
 	}
 
 
-	printf( "Flattening send tables..." );
+	if ( g_bDumpDataTables )
+	{
+		printf( "Flattening data tables..." );
+	}
 	for ( int i = 0; i < nServerClasses; i++ )
 	{
 		FlattenDataTable( i );
 	}
-	printf( "Done.\n" );
+	if ( g_bDumpDataTables )
+	{
+		printf( "Done.\n" );
+	}
 
 	// perform integer log2() to set s_nServerClassBits
 	int nTemp = nServerClasses;
@@ -1151,7 +1505,20 @@ bool ParseDataTable( CBitRead &buf )
 bool DumpStringTable( CBitRead &buf, bool bIsUserInfo )
 {
 	int numstrings = buf.ReadWord();
-	printf( "%d\n", numstrings );
+	if ( g_bDumpStringTables )
+	{
+		printf( "%d\n", numstrings );
+	}
+
+	if( bIsUserInfo )
+	{
+		if ( g_bDumpStringTables )
+		{
+			printf( "Clearing player info array.\n" );
+		}
+		s_PlayerInfos.clear();
+	}
+
 	for ( int i = 0 ; i < numstrings; i++ )
 	{
 		char stringname[4096];
@@ -1169,7 +1536,7 @@ bool DumpStringTable( CBitRead &buf, bool bIsUserInfo )
 
 			buf.ReadBytes( data, userDataSize );
 
-			if( bIsUserInfo && userDataSize == sizeof( player_info_t ) )
+			if( bIsUserInfo && data != NULL )
 			{
 				const player_info_t *pUnswappedPlayerInfo = ( const player_info_t * )data;
 				player_info_t playerInfo = *pUnswappedPlayerInfo;
@@ -1178,23 +1545,33 @@ bool DumpStringTable( CBitRead &buf, bool bIsUserInfo )
 				LowLevelByteSwap( &playerInfo.userID, &pUnswappedPlayerInfo->userID );
 				LowLevelByteSwap( &playerInfo.friendsID, &pUnswappedPlayerInfo->friendsID );
 
-				printf( "***player info:    xuid:%lld name:%s userID:%d guid:%s friendsID:%d friendsName:%s fakeplayer:%d ishltv:%d filesDownloaded:%d\n",
-					playerInfo.xuid, playerInfo.name, playerInfo.userID, playerInfo.guid, playerInfo.friendsID,
-					playerInfo.friendsName, playerInfo.fakeplayer, playerInfo.ishltv, playerInfo.filesDownloaded );
+				if ( g_bDumpStringTables )
+				{
+					printf( "adding:player info:\n xuid:%lld\n name:%s\n userID:%d\n guid:%s\n friendsID:%d\n friendsName:%s\n fakeplayer:%d\n ishltv:%d\n filesDownloaded:%d\n",
+						playerInfo.xuid, playerInfo.name, playerInfo.userID, playerInfo.guid, playerInfo.friendsID,
+						playerInfo.friendsName, playerInfo.fakeplayer, playerInfo.ishltv, playerInfo.filesDownloaded );
+				}
+
+				s_PlayerInfos.push_back( playerInfo );
 			}
 			else
 			{
-				printf( " %d, %s, userdata[%d] \n", i, stringname, userDataSize );
+				if ( g_bDumpStringTables )
+				{
+					printf( " %d, %s, userdata[%d] \n", i, stringname, userDataSize );
+				}
 			}
 
-			delete[] data;
+			delete [] data;
 
 			assert( buf.GetNumBytesLeft() > 10 );
-			
 		}
 		else
 		{
-			printf( " %d, %s \n", i, stringname );
+			if ( g_bDumpStringTables )
+			{
+				printf( " %d, %s \n", i, stringname );
+			}
 		}
 	}
 
@@ -1219,7 +1596,10 @@ bool DumpStringTable( CBitRead &buf, bool bIsUserInfo )
 
 				if ( i >= 2 )
 				{
-					printf( " %d, %s, userdata[%d] \n", i, stringname, userDataSize );
+					if ( g_bDumpStringTables )
+					{
+						printf( " %d, %s, userdata[%d] \n", i, stringname, userDataSize );
+					}
 				}
 
 				delete[] data;
@@ -1229,7 +1609,10 @@ bool DumpStringTable( CBitRead &buf, bool bIsUserInfo )
 			{
 				if ( i >= 2 )
 				{
-					printf( " %d, %s \n", i, stringname );
+					if ( g_bDumpStringTables )
+					{
+						printf( " %d, %s \n", i, stringname );
+					}
 				}
 			}
 		}
@@ -1246,10 +1629,12 @@ bool DumpStringTables( CBitRead &buf )
 		char tablename[ 256 ];
 		buf.ReadString( tablename, sizeof( tablename ) );
 
-		printf( "ReadStringTable:%s:", tablename );
+		if ( g_bDumpStringTables )
+		{
+			printf( "ReadStringTable:%s:", tablename );
+		}
 
 		bool bIsUserInfo = !strcmp( tablename, "userinfo" );
-
 		if ( !DumpStringTable( buf, bIsUserInfo ) )
 		{
 			printf( "Error reading string table %s\n", tablename );
@@ -1261,6 +1646,8 @@ bool DumpStringTables( CBitRead &buf )
 
 void CDemoFileDump::DoDump()
 {
+	s_bMatchStartOccured = false;
+
 	bool demofinished = false;
 	while ( !demofinished )
 	{
@@ -1268,7 +1655,7 @@ void CDemoFileDump::DoDump()
 		unsigned char	cmd;
 		unsigned char	playerSlot;
 		m_demofile.ReadCmdHeader( cmd, tick, playerSlot );
-
+		s_nCurrentTick = tick;
 		// COMMAND HANDLERS
 		switch ( cmd )
 		{

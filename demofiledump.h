@@ -27,6 +27,7 @@
 
 #include "demofile.h"
 #include "demofilebitbuf.h"
+#include "demofilepropdecode.h"
 
 #include "generated_proto/netmessages_public.pb.h"
 
@@ -120,6 +121,22 @@ struct ServerClass_t
 	std::vector< FlattenedPropEntry > flattenedProps;
 };
 
+struct PropEntry
+{
+	PropEntry( FlattenedPropEntry *pFlattenedProp, Prop_t *pPropValue )
+		: m_pFlattenedProp( pFlattenedProp )
+		, m_pPropValue( pPropValue )
+	{
+	}
+	~PropEntry()
+	{
+		delete m_pPropValue;
+	}
+
+	FlattenedPropEntry *m_pFlattenedProp;
+	Prop_t *m_pPropValue;
+};
+
 struct EntityEntry
 {
 	EntityEntry( int nEntity, uint32 uClass, uint32 uSerialNum)
@@ -128,9 +145,48 @@ struct EntityEntry
 		, m_uSerialNum( uSerialNum )
 	{
 	}
+	~EntityEntry()
+	{
+		for ( std::vector< PropEntry * >::iterator i = m_props.begin(); i != m_props.end(); i++ )
+		{
+			delete *i;
+		}
+	}
+	PropEntry *FindProp( const char *pName )
+	{
+		for ( std::vector< PropEntry * >::iterator i = m_props.begin(); i != m_props.end(); i++ )
+		{
+			PropEntry *pProp = *i;
+			if (  pProp->m_pFlattenedProp->m_prop->var_name().compare( pName ) == 0 )
+			{
+				return pProp;
+			}
+		}
+		return NULL;
+	}
+	void AddOrUpdateProp( FlattenedPropEntry *pFlattenedProp, Prop_t *pPropValue )
+	{
+		//if ( m_uClass == 34 && pFlattenedProp->m_prop->var_name().compare( "m_vecOrigin" ) == 0 )
+		//{
+		//	printf("got vec origin!\n" );
+		//}
+		PropEntry *pProp = FindProp( pFlattenedProp->m_prop->var_name().c_str() );
+		if ( pProp )
+		{
+			delete pProp->m_pPropValue;
+			pProp->m_pPropValue = pPropValue;
+		}
+		else
+		{
+			pProp = new PropEntry( pFlattenedProp, pPropValue );
+			m_props.push_back( pProp );
+		}
+	}
 	int m_nEntity;
 	uint32 m_uClass;
 	uint32 m_uSerialNum;
+
+	std::vector< PropEntry * > m_props;
 };
 
 enum UpdateType
