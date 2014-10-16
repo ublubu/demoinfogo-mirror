@@ -365,7 +365,8 @@ bool ShowPlayerInfo( const char *pField, int nIndex, bool bShowDetails = true, b
 
 		if ( bShowDetails )
 		{
-			EntityEntry *pEntity = FindEntity( nIndex - 1 );
+			int nEntityIndex = FindPlayerEntityIndex( nIndex ) + 1;
+			EntityEntry *pEntity = FindEntity( nEntityIndex );
 			if ( pEntity )
 			{
 				PropEntry *pXYProp = pEntity->FindProp( "m_vecOrigin" );
